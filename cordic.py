@@ -26,8 +26,13 @@ This demonstrates using decimal CORDIC for:
 * requires extra multiplication or division
 """
 
-# end criterion with expansion estimator 1+10**(-2i) if j odd!
-# cordic that stops on x or y value and enpands the stop value with estimator
+# Ideas for future version that includes asin/acos/asinh/atanh
+# make expansion estimator 1+10**(-2i)/2
+# do this my only multiplying 1+10**(-2i) if j odd
+# (and of course starting x just the right value to make the result work)
+# then make cordic version that stops on x or y value,
+# expanding the stop value with input expanded by estimator
+# this is the decimal version of https://ieeexplore.ieee.org/ielx7/8920/4358609/10082948.pdf
 
 import math, operator, random
 from itertools import chain
