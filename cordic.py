@@ -5,26 +5,31 @@ Assumes hardware with very limited functionality:
     add/subtract tabled values
     compare with zero
 that can then be used for all kinds of operations.
+Operattion takes 9 * DIGITS passes through the loop
+which is three additions, two shifts, and a compare
 
 This demonstrates using decimal CORDIC for:
     multiplication
     division
-    octal -> decimal conversion
-    decimal -> octal conversion
-    tan
-    sin/cos
-    atan
-    tanh
-    sinh/cosh
+    tan *, tandeg *
+    sin, sindeg
+    cos, cosdeg
+    atan, atandeg
+    hypot *
+    tanh *
+    sinh
+    cosh
     exp
     atanh
     log
+    sqrt
+* requires extra multiplication or division
 """
-#NOTE: the doctests are showing the accuracy, so they all fail if you change DIGITS
-#that's not a problem; I should think of doctest output that's clear and still
-#does not depend on DIGITS
 
-import math
+# end criterion with expansion estimator 1+10**(-2i) if j odd!
+# cordic that stops on x or y value and enpands the stop value with estimator
+
+import math, operator, random
 from itertools import chain
 from collections import namedtuple
 
@@ -33,7 +38,8 @@ TRIG, LINEAR, HYP = -1, 0, 1
 ROTATE, VECTOR = 0,1
 
 # decimal computation values
-DIGITS = 7
+# total digits including the first
+DIGITS = 1 + 6
 MAX = 10 ** DIGITS
 SCALE = MAX // 10
 
@@ -83,7 +89,14 @@ class Fixed:
         return Fixed(self.value - other.value)
 
     def __rshift__(self, s):
-        return Fixed(self.value // 10 ** s)
+        if not s: return self
+        divider = 10 ** s
+        t, rem = divmod(self.value, divider)
+        # round as good as possible
+        if rem * 2 > divider: t += 1
+        elif rem * 2 < divider: pass
+        elif t % 2: t += 1
+        return Fixed(t)
 
     def __lshift__(self, s):
         return Fixed(self.value * 10 ** s)
@@ -97,7 +110,7 @@ class Fixed:
         return self.value > 0
 
     def __rmul__(self, smallInt):
-        """
+        """Allow multiplication with -1,0,1
         >>> -1 * Fixed(0.25)
         -0.250000
         """
@@ -118,13 +131,24 @@ class Fixed:
         return Fixed(-self.value)
 
     def accuracy(self, exactValue):
-        """Compute accuracy with respect to correct value
+        """Compute absolute accuracy with respect to correct value
+        Gives a good idea of the performance
         """
         scaled = self.value / SCALE
         if not scaled: return float(DIGITS)
         return round(
-            -math.log10(abs((scaled - exactValue) / exactValue)),
+            -math.log10(abs(scaled - exactValue)),
             1)
+
+    def ulpErr(self, exactValue):
+        """Compute absolute accuracy  expressed in ULP
+        >>> sin(4.0).ulpErr(math.sin(4))
+        11
+        """
+        return abs((self - Fixed(exactValue)).value)
+
+    def __float__(self):
+        return self.value / SCALE
 
 
 # some convenient values
@@ -144,6 +168,10 @@ def makeCordic(kind, table, start=0, repeat=9):
     LINEAR  operate on y only    10**-i
     HYP     hyperbolic           atanh(10**-i)  sqrt(1-10**-2i)
     """
+    assert max(
+        c2.value / c1.value
+        for c1,c2 in zip(table[:-1], table[1:])
+        ) <= repeat + 1, "repeat too low"
     def cordic(mode, *, a=F0, x=F1, y=F0):
         """The routine doing the vector rotation
         mode
@@ -162,236 +190,267 @@ def makeCordic(kind, table, start=0, repeat=9):
         return CordicResult(a, x, y)
     return cordic
 
-__test__ = {
-'trig': '''
-    >>> trig = makeCordic(TRIG, [
-    ...    Fixed(math.atan(10 ** -i))
-    ...    for i in range(DIGITS - 1)
-    ...    ])
-    >>> trigConst = math.prod(
-    ...    1 + 100 ** -i
-    ...    for i in range(DIGITS - 1)
-    ...    ) ** (9 / 2)
-    >>> trig(ROTATE, a=F1).y.accuracy(math.sin(1) * trigConst)
-    5.6
-    >>> trig(ROTATE, a=F1).x.accuracy(math.cos(1) * trigConst)
-    5.3
-    >>> trig(VECTOR, y=Fixed(3.0)).a.accuracy(math.atan(3))
-    5.2
-    >>> trig(VECTOR, x=Fixed(3.0), y=Fixed(4.0)).x.accuracy(5 * trigConst)
-    7.0
-    ''',
-}
 
-
-def cordic(s, table, depth=9):
-    """cordic routine
-    One single routine for doing everything,
-    using only addition, subtraction, decimal shift
-    and comparison with 0
-    s: step direction (-1 for trig, 0 for linear, 1 for hyp)
-    Table has values for
-    2, 1.1, 1.01, ..., 1+10**-DIGITS
-    m: mode
-    ROTATE: input in a (range -10..10), output in x,y (int)
-    VECTOR: input in x,y, output in a
-    """
-    def f(m, a=0, x0=1, y0=0):
-        x, y = int(x0*SCALE), int(y0*SCALE)
-        for i,tablei in enumerate(table):
-            if not tablei: continue
-            for j in range(depth):
-                if (a, -y)[m] > 0:
-                    a -= tablei
-                    x,y = (
-                        x + s * y // 10 ** i,
-                        y + x // 10 ** i)
-                else:
-                    a += tablei
-                    x,y = (
-                        x - s * y // 10 ** i,
-                        y - x // 10 ** i)
-        return a, x, y
-    return f
-
-def accuracy(approx, value):
-    """Compute number of digits of accuracy
-    """
-    return round(
-        -math.log10(abs(
-            (approx - value) / value
-            or 1 / SCALE
-        )),
-        1)
-        
-# Let's start simple: multiplication and division
-linTable = [
-    10 ** -i
+linear = makeCordic(LINEAR, [
+    Fixed(SCALE // 10 ** i)
     for i in range(DIGITS)
-    ]
-linCordic = cordic(0, linTable)
+    ])
 
 def mul(a, b):
+    """First argument cannot be larger than 10!
+    >>> mul(1.3, 1.5).accuracy(1.95)
+    5.5
     """
-    >>> accuracy(mul(5, 7),35)
-    6.7
-    """
-    a, x, y = linCordic(ROTATE, a=a, x0=b)
-    return y / SCALE
+    return linear(ROTATE, a=Fixed(a), x=Fixed(b)).y
 
 def div(a, b):
     """
-    >>> accuracy(div(1, 3), 1/3)
-    6.0
+    >>> div(.5, .7).accuracy(5 / 7)
+    5.9
     """
-    a, x, y = linCordic(VECTOR, x0=b, y0=a)
-    return a
+    return linear(VECTOR, y=Fixed(a), x=Fixed(b)).a
 
-octTable = [
-    8 ** (DIGITS - 1 - i)
-    for i in range(DIGITS)
-    ]
-octCordic = cordic(0, octTable)
-def oct2dec(n):
-    """
-    >>> oct2dec(0o12345)
-    ... #doctest:+SKIP
-    12345
-    """
-    a, x, y = octCordic(ROTATE, a=n, x0=.1)
-    return x
 
-def dec2oct(n):
-    """
-    >>> oct(dec2oct(123456))
-    ... #doctest:+SKIP
-    '0o123456'
-    """
-    return octCordic(VECTOR, x0=.1, y0=n)
+# trig in rad
+trig = makeCordic(TRIG, [
+    Fixed(math.atan(10 ** -i))
+   for i in range(DIGITS - 1)
+   ])
 
-# a bit of trigonometry
-trigTable = [
-    math.atan(10 ** -i)
-    for i in range(DIGITS)
-    ]
-trigCordic = cordic(-1, trigTable)
-trigConst = math.prod(
-    (1 + 100 ** -i)
-    for i in range(DIGITS)
-    ) ** (9 / 2) * SCALE
+# correction for trig
+trigConst = Fixed(1 / math.prod(
+        (1 + 100 ** -i)
+        for i in range(DIGITS - 1)
+        ) ** (9 / 2))
 
 def sin(x):
-    """ accuracy(sin(1), math.sin(1))
-    6.1
     """
-    a, x, y = trigCordic(ROTATE, a=x)
-    print(a, x, y)
-    return y / trigConst
+    >>> sin(1.).accuracy(math.sin(1))
+    6.0
+    """
+    return trig(ROTATE, a=Fixed(x), x=trigConst).y
 
 def cos(x):
-    """ accuracy(cos(1), math.cos(1))
-    6.1
     """
-    a, x, y = trigCordic(ROTATE, a=x)
-    print(a, x, y)
-    return x / trigConst
+    >>> cos(1.2).accuracy(math.cos(1.2))
+    5.5
+    """
+    return trig(ROTATE, a=Fixed(x), x=trigConst).x
 
 def tan(x):
     """
-    >>> accuracy(tan(1), math.tan(1))
-    ... #doctest:+SKIP
-    6.5
+    >>> tan(5.3).accuracy(math.tan(5.3))
+    4.4
     """
-    a, x, y = trigCordic(ROTATE, a=x)
-    return y / x
-
-
-def hypot(a, b):
-    """
-    >>> accuracy(hypot(.3,.4), .5)
-    ... #doctest:+SKIP
-    7.3
-    """
-    a, x, y = trigCordic(VECTOR, x0=a, y0=b)
-    return x / trigConst
-
+    t = trig(ROTATE, a=Fixed(x))
+    return div(t.y, t.x)
 
 def atan(x):
     """
-    >>> accuracy(atan(math.sqrt(3)), math.pi / 3)
-    ... #doctest:+SKIP
-    6.3
+    >>> atan(5.3).accuracy(math.atan(5.3))
+    5.8
     """
-    a, x, y = trigCordic(VECTOR, y0=x)
-    return a
+    return trig(VECTOR, y=Fixed(x)).a
 
-# now do the hyperbolics and logarithm
-hypTable = [
-    math.atanh(10 ** -i) if i else 0
-    for i in range(DIGITS)
-    ]
-hypCordic = cordic(1, hypTable, 10)
+def hypot(a, b):
+    """pretty terrible accuracy, alas
+    >>> hypot(.333, .444).accuracy(.555)
+    5.0
+    """
+    return mul(
+        trigConst,
+        trig(VECTOR, x=Fixed(a), y=Fixed(b)).x,
+        )
+
+# trig in tens of degrees
+deg = makeCordic(TRIG, [
+    Fixed(math.atan(10 ** -i) * 18 / math.pi)
+    for i in range(DIGITS - 0)
+    ])
+
+# correction for trig
+degConst = Fixed(1 / math.prod(
+        1 + (100 ** -i)
+        for i in range(DIGITS - 0)
+        ) ** (9 / 2))
+
+def sindeg(x):
+    """
+    >>> sindeg(1.1).accuracy(math.sin(math.pi / 180 * 11))
+    5.7
+    """
+    return deg(ROTATE, a=Fixed(x), x=degConst).y
+
+def cosdeg(x):
+    """
+    >>> cosdeg(2.2).accuracy(math.cos(math.pi / 180 * 22))
+    5.1
+    """
+    return deg(ROTATE, a=Fixed(x), x=degConst).x
+
+def tandeg(x):
+    """
+    >>> tandeg(3.3).accuracy(math.tan(math.pi / 180 * 33))
+    6.2
+    """
+    t = deg(ROTATE, a=Fixed(x))
+    return div(t.y, t.x)
+
+def atandeg(x):
+    """
+    >>> atandeg(5.3).accuracy(math.atan(5.3) * 18 / math.pi)
+    5.0
+    """
+    return deg(VECTOR, y=Fixed(x)).a
+
+
+# hyperbolic functions
+# works only for abs(a) < 1
+hyp = makeCordic(HYP, [
+   Fixed(math.atanh(10 ** -i))
+   for i in range(1, DIGITS - 1)
+   ], repeat=9, start=1)
+
+# correction for hyp and sqrt
 hypConst = math.prod(
-    1 - 100 ** -i or 1
-    for i in range(DIGITS)
-    ) ** (10 / 2) * SCALE
-def tanh(x):
-    """
-    >>> accuracy(tanh(1),  math.tanh(1))
-    ... #doctest:+SKIP
-    6.3
-    """
-    a, x, y = hypCordic(ROTATE, a=x)
-    return y / x
+        (1 - 100 ** -i)
+        for i in range(1, DIGITS - 1)
+        ) ** (9 / 2)
+
+sqrtConst = Fixed(hypConst ** -2 / 4)
+hypConst = Fixed(1 / hypConst)
 
 def sinh(x):
     """
-    >>> accuracy(sinh(1), math.sinh(1))
-    ... #doctest:+SKIP
-    5.8
+    >>> sinh(.4).accuracy(math.sinh(.4))
+    6.5
     """
-    a, x, y = hypCordic(ROTATE, a=x)
-    return y / hypConst
+    return hyp(ROTATE, a=Fixed(x), x=hypConst).y
 
 def cosh(x):
     """
-    >>> accuracy(cosh(1), math.cosh(1))
-    ... #doctest:+SKIP
-    6.0
+    >>> cosh(.2).accuracy(math.cosh(.2))
+    5.6
     """
-    a, x, y = hypCordic(ROTATE, a=x)
-    return x / hypConst
- 
-def exp(x):
+    return hyp(ROTATE, a=Fixed(x), x=hypConst).x
+
+def tanh(x):
     """
-    >>> accuracy(exp(1), math.exp(1))
-    ... #doctest:+SKIP
-    6.4
+    >>> tanh(.31).accuracy(math.tanh(.31))
+    7.0
     """
-    a, x, y = hypCordic(ROTATE, a=x/2)
-    return (x + y) / (x - y)
+    t = hyp(ROTATE, a=Fixed(x))
+    return div(t.y, t.x)
 
 def atanh(x):
     """
-    >>> accuracy(atanh(.5), math.atanh(.5))
-    ... #doctest:+SKIP
-    7.0
+    >>> atanh(0.53).accuracy(math.atanh(0.53))
+    6.8
     """
-    a, x, y = hypCordic(VECTOR, y0=x)
-    return a
+    return hyp(VECTOR, y=Fixed(x)).a
+
+def exp(x):
+    """
+    >>> exp(.31).accuracy(math.exp(.31))
+    5.0
+    """
+    t = hyp(ROTATE, a=Fixed(x), x=hypConst)
+    return t.x + t.y
 
 def log(x):
     """
-    >>> accuracy(log(1/3), math.log(1/3))
-    ... #doctest:+SKIP
-    7.0
-    >>> accuracy(log(math.pi), math.log(math.pi))
-    ... #doctest:+SKIP
-    6.1
+    >>> log(1/3).accuracy(math.log(1/3))
+    5.6
+    >>> log(math.pi).accuracy(math.log(math.pi))
+    6.9
     """
-    a, x, y =  hypCordic(VECTOR, x0=1+x, y0=1-x)
-    return -2 * a
+    result = hyp(VECTOR, x=F1+Fixed(x), y=F1-Fixed(x)).a
+    return -result - result
+
+def sqrt(x):
+    """
+    >>> sqrt(.5).accuracy(math.sqrt(.5))
+    6.7
+    >>> sqrt(1.9).accuracy(math.sqrt(1.9))
+    5.7
+    """
+    return hyp(VECTOR, x=sqrtConst+Fixed(x), y=sqrtConst-Fixed(x)).x
+
+def testRoutine(myfn, sysfn, params=1, repeat=1000):
+    """
+    Test CORDIC routine with different values
+    and compute range and RMS relative error in digits
+    >>> testRoutine(sin, math.sin)
+    ... #doctest:+SKIP
+    sin     -8.1.. 8.1  5.7   78%
+    ([-8.083713], [8.076818], [])    """
+    errors = []
+    sumsq = accurate = 0
+    # maximum allowed error in result to be counted
+    # 4 digits absolute precision loss accepted for OK
+    margin = 10 ** (3 - DIGITS)
+    count = 0
+    if myfn.__name__.endswith(('h','exp')): low,high = -0.9, 0.9
+    elif myfn.__name__ in ('log, sqrt, hypot'): low,high = 0, 2
+    else: low,high = -9, 9
+    minOK = [low] * params
+    maxOK = [high] * params
+    worstError = 0
+    while count < repeat:
+        point = [round(random.uniform(low, high), DIGITS - 1) for j in range(params)]
+        if myfn.__name__ == 'div':
+            point[1] = abs(point[1])
+        try:
+            exact = sysfn(*point)
+        except (ValueError, OverflowError, ZeroDivisionError):
+            continue
+        count += 1
+        try:
+            result = float(myfn(*point))
+            if (error := abs((result - exact))) < margin:
+                sumsq += ((result - exact) / exact) ** 2
+                accurate += 1
+            else:
+                #if error > worstError:
+                #    worstError = error
+                #    print(point, error)
+                for i,x in enumerate(point):
+                    if minOK[i] < x < 0: minOK[i] = x
+                    if maxOK[i] > x > 0: maxOK[i] = x
+        except Exception:
+            errors.append(point)
+    if accurate and sumsq:
+        precision = -math.log10(math.sqrt(sumsq) / accurate)
+    else:
+        precision = 0
+    #precision = math.sqrt(sumsq) / accurate * SCALE
+    print(
+        f"{myfn.__name__:<7s}"
+        f"{max(minOK):5.1f}..{min(maxOK):4.1f}"
+        f"{precision:5.1f}"
+        f"  {accurate / repeat:4.0%}")
+    return minOK, maxOK, errors
+
+def testPerf():
+    print("Routine  range    #digits  OK")
+    for fn in (
+            "sin cos tan atan "
+            "sindeg cosdeg tandeg atandeg "
+            "sinh cosh tanh atanh "
+            "exp log sqrt ".split()):
+        if fn == 'atandeg':
+            mfn = lambda x: getattr(math, fn[:-3])(x) / math.pi * 18
+        elif fn.endswith('deg'):
+            mfn = lambda x: getattr(math, fn[:-3])(x / 18 * math.pi)
+        else:
+            mfn = getattr(math, fn)
+        testRoutine(globals()[fn], mfn, 1)
+    testRoutine(mul, operator.mul, 2)
+    testRoutine(div, operator.truediv, 2)
+    testRoutine(hypot, math.hypot, 2)
+
 
 if __name__ == "__main__":
     import doctest
     doctest.testmod()
+    testPerf()
